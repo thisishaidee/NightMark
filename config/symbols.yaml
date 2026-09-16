@@ -1,0 +1,28 @@
+# Nightmark symbol weekend-eligibility configuration.
+#
+# WHY THIS IS A SEPARATE FILE FROM sessions.yaml:
+# sessions.yaml answers "when is the weekend trading window open" (a pure
+# time question). This file answers a completely different question: which
+# SYMBOLS Bitget actually allows to trade during that window. Bitget only
+# supports weekend rToken trading for an explicit, Bitget-curated list that
+# has expanded over time (61 symbols per the "22 New rTokens" update used
+# as a source in sessions.yaml, growing to 93+ per later Bitget
+# announcements found during Phase 1 research). That list is not fixed and
+# is not something Nightmark should freeze into the codebase from
+# secondary sources.
+#
+# Phase 1 intentionally ships with an EMPTY eligibility set:
+#   - No symbol is assumed weekend-eligible by default.
+#   - A WEEKEND session classification (src/calendar.py) never by itself
+#     implies any specific symbol may trade - see src/eligibility.py.
+#   - Unknown/unconfigured symbols fail closed (not eligible), not open.
+#
+# BEFORE LIVE OR PAPER TRADING:
+# This list MUST be populated from an authoritative, current Bitget source
+# (e.g. Bitget's own published/queryable list of weekend-enabled rTokens at
+# the time of trading, not a snapshot from Phase 1 research articles which
+# are already known to be stale/expanding). Populating this file is a data
+# task requiring its own review - it should not be done by silently
+# copying a list out of a blog post or news article.
+
+weekend_eligible_symbols: []

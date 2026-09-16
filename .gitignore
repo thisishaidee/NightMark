@@ -1,0 +1,23 @@
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/
+*.egg-info/
+
+# Secrets / credentials - never committed
+.env
+.env.*
+*.pem
+*.key
+*credential*
+*secret*
+id_rsa*
+.aws/
+.netrc
+
+# OS / editor junk
+.DS_Store
+Thumbs.db
+*.swp
+.idea/
+.vscode/

@@ -1,0 +1,40 @@
+# Nightmark signal-engine configuration.
+#
+# All thresholds are starting policy parameters as specified for Phase 2C,
+# not calibrated against real Bitget rToken behavior yet - see the
+# Phase 2B mark_quality.yaml precedent for the same caveat pattern.
+# Nothing here is fabricated market data; these are configured decision
+# thresholds, kept out of src/signal.py so they can be tuned without
+# touching business logic.
+
+fade:
+  # SIGNAL A - FADE UNEXPLAINED DISLOCATION
+  #
+  # Minimum |basis_bps| required before an unexplained dislocation is even
+  # considered worth fading. Below this, the move is treated as noise
+  # regardless of how extended its z-score is.
+  min_abs_basis_bps: 20.0
+
+  # Minimum |basis_zscore| (same-session z-score of basis_bps, from
+  # src/zscore.py) required - how extended the current basis is relative
+  # to its own recent same-session history. Below this, even a large
+  # absolute basis isn't yet "unusual" for this ticker/session.
+  entry_abs_zscore: 1.5
+
+follow:
+  # SIGNAL B - FOLLOW EXPLAINED RESIDUAL
+  #
+  # Minimum |witness move| (bps) required before a 24/7 witness-market
+  # move is considered meaningful enough to act on at all. Starting value
+  # is inside the specified 40-80 bps range.
+  min_witness_move_bps: 60.0
+
+  # Minimum |residual| (bps) required before FOLLOW fires. The residual is
+  # the portion of the witness market's move NOT yet reflected in the
+  # rToken's own basis (residual_bps = witness.move_bps - basis_bps). A
+  # residual near zero means the rToken has already caught up to the
+  # witness move - nothing left to follow. A residual with the wrong sign
+  # (opposite the witness direction) means the rToken has already moved
+  # past the witness move, not lagged it - see "direction mismatch" in
+  # tests/test_signal.py.
+  min_residual_bps: 15.0

@@ -1,0 +1,180 @@
+# Nightmark session schedule configuration
+#
+# This file is the single source of truth for session boundaries.
+# src/calendar.py reads this file and MUST NOT hardcode session times.
+#
+# ============================================================================
+# RTH (regular trading hours)
+# ============================================================================
+# Standard NYSE/NASDAQ hours, 09:30-16:00 America/New_York, Mon-Fri. This is
+# not a Bitget-specific figure - it is the underlying U.S. cash market
+# session that Nightmark's whole thesis is defined relative to ("trade only
+# when the U.S. cash market is closed").
+#
+# ============================================================================
+# POST (post-market) - Nightmark convention, not a Bitget-published rToken
+# session label
+# ============================================================================
+# Window: 16:00-20:00 America/New_York.
+#
+# This is the standard US-equity extended-hours convention. Bitget's own
+# rToken documentation does NOT publish an exact "16:00-20:00 ET rToken
+# post-market session" - Bitget's rToken venue is presented as trading
+# continuously outside RTH (pre-market, post-market, overnight all blend
+# into continuous access per the Bitget support FAQ), with the one sharp,
+# explicitly-timed Bitget-published boundary being the weekend window open
+# below. Nightmark still needs a POST/OVERNIGHT split for its own session
+# bookkeeping and risk posture, so it borrows the conventional US-equity
+# 16:00-20:00 ET post-market definition as an internal transition boundary
+# - the important, Bitget-sourced fact is simply that this boundary is
+# where Nightmark's OVERNIGHT session begins counting from on non-Friday
+# weeknights, and where the weekend matching window begins on Fridays.
+# NEEDS HUMAN APPROVAL if a stricter or different internal boundary is
+# preferred (see Phase 1 report / README "Phase 1 Calendar Assumptions").
+#
+# ============================================================================
+# WEEKEND (Bitget rToken weekend matching window) - Bitget-sourced
+# ============================================================================
+# Primary source (official Bitget Support Center, already used in this
+# project - no third-party sources introduced):
+#   "Bitget Adds 24/7 Trading Support for 22 New rTokens"
+#   https://www.bitget.com/support/articles/12560603889487
+#
+#   Quoted (opening side): "Weekend trading connects seamlessly with
+#   regular US stock market hours, adopting a continuous trading model:
+#     Opening Time:
+#       Summer Time (DST): Opens every Saturday at 08:00 (UTC+8)
+#       Winter Time (Standard Time): Opens every Saturday at 09:00 (UTC+8)
+#     Continuous Trading: From the opening, the market will run
+#     continuously until the regular US stock market opens on Monday."
+#
+# Project stakeholders have additionally documented the matching schedule
+# in a paired open/close form for both DST regimes:
+#     US daylight saving time:  Saturday 08:00 UTC+8 -> Monday 08:00 UTC+8
+#     US standard time:         Saturday 09:00 UTC+8 -> Monday 09:00 UTC+8
+# The open side of this is directly corroborated by the quoted support
+# article above. The Monday-side UTC+8 close figure is carried here as
+# provided by project stakeholders for this hardening pass; the support
+# article itself only states the close qualitatively as "until the regular
+# US stock market opens on Monday" rather than a bare UTC+8 clock time.
+# Nightmark's own boundary is anchored to that qualitative close (Monday
+# RTH open), which happens to agree with the paired figures above once
+# normalized - see below.
+#
+# NORMALIZATION (Nightmark-derived, NOT a Bitget-native label):
+#   Both DST-variant UTC+8 opening times normalize to the SAME
+#   America/New_York wall-clock time:
+#     - Summer: Sat 08:00 UTC+8 = Fri 20:00 ET (US in DST, UTC-4)
+#     - Winter: Sat 09:00 UTC+8 = Fri 20:00 ET (US in standard time, UTC-5)
+#   And the close - "until the regular US stock market opens on Monday" -
+#   normalizes to the Monday RTH open boundary: 09:30 ET.
+#
+#   Nightmark therefore encodes the weekend window directly as:
+#       Friday 20:00 ET  ->  Monday 09:30 ET
+#   This is Nightmark's normalized interpretation of Bitget's UTC+8
+#   schedule, expressed in America/New_York wall-clock time so the config
+#   does not need editing across US DST changes. It is NOT a claim that
+#   Bitget itself publishes "Friday 20:00 ET" or "Monday 09:30 ET" as its
+#   native session labels - Bitget's native schedule is stated in UTC+8
+#   with a DST-dependent opening clock time, as quoted above.
+#
+# SCOPE LIMITATION: this schedule applies to the *supported* rToken list
+# only (61-93+ names as of the source articles used during Phase 1
+# research, expanding over time). This config file describes WHEN the
+# weekend window is open; it says nothing about WHICH symbols are eligible
+# during it. Per-symbol weekend eligibility is a separate, explicit gate -
+# see config/symbols.yaml and src/eligibility.py. A timestamp classifying
+# as WEEKEND here must never, by itself, be read as "this symbol may trade
+# weekends."
+#
+# ============================================================================
+# OVERNIGHT - Nightmark's residual closed-cash session, not a named Bitget
+# session
+# ============================================================================
+# Bitget does not separately name or publish fixed boundaries for an
+# "overnight" session. Nightmark defines OVERNIGHT as the residual weekday
+# window that is outside RTH, outside POST, outside the WEEKEND window, and
+# outside any configured HALT/market closure:
+#     00:00-09:30 ET (pre-market)
+#     20:00-24:00 ET (post-close)
+# on weeknights that are NOT already claimed by the Friday-Monday weekend
+# window above (i.e. Sun-night-into-Mon is WEEKEND, not OVERNIGHT; Mon/Tue/
+# Wed/Thu nights are OVERNIGHT). Folding pre-market into the same
+# OVERNIGHT category (rather than a separate PRE session) is a deliberate
+# Phase-1 simplification, kept because the existing architecture does not
+# yet need the distinction - the trading gate treats OVERNIGHT and WEEKEND
+# identically (both eligible), so no strategy behavior currently depends on
+# separating pre-market from post-close.
+#
+# ============================================================================
+
+timezone: "America/New_York"
+
+rth:
+  start: "09:30"
+  end: "16:00"
+  weekdays: [MON, TUE, WED, THU, FRI]
+
+post:
+  start: "16:00"
+  end: "20:00"
+  weekdays: [MON, TUE, WED, THU, FRI]
+  source_note: "US-equity extended-hours convention used internally by Nightmark as a session-bookkeeping boundary. Bitget does not publish an exact rToken post-market window under this label. NEEDS APPROVAL if a different internal boundary is preferred."
+
+weekend:
+  # Friday close-of-post-market -> Monday RTH open, expressed directly in
+  # ET. See the WEEKEND section above for full sourcing and normalization
+  # notes - this is Nightmark's normalized boundary, not Bitget's native
+  # UTC+8 label.
+  open_weekday: FRI
+  open_time: "20:00"
+  close_weekday: MON
+  close_time: "09:30"
+  source: "https://www.bitget.com/support/articles/12560603889487"
+  source_note: "Bitget publishes the open side in UTC+8 with a DST-dependent clock time and states the close qualitatively as 'until the regular US stock market opens on Monday'. Both normalize to Fri 20:00 ET -> Mon 09:30 ET; encoded directly in ET so this block never needs edits across US DST changes. Not a claim that Bitget natively publishes ET-labeled boundaries."
+
+overnight:
+  # Residual weekday window outside RTH/POST/WEEKEND/HALT, split at
+  # midnight only for readability; treated as one OVERNIGHT session type.
+  pre_market_start: "00:00"
+  pre_market_end: "09:30"
+  post_close_start: "20:00"
+  post_close_end: "24:00"
+  applies_weeknights: [SUN_NIGHT_INTO_MON, MON, TUE, WED, THU]
+  source_note: "Not a named Bitget session; Nightmark's residual-window definition for the weekday period outside RTH/POST/WEEKEND/HALT. See OVERNIGHT section above."
+
+# Manually configured halt windows for Phase 1 (no live feed).
+# Each entry is an explicit [start, end) in the configured timezone, ISO 8601.
+# Empty by default; strategy/tests may inject halts via this list or by
+# passing halt windows directly to the calendar at construction time.
+halts: []
+
+# ============================================================================
+# Market closures (formerly a flat "holidays" list) - architecture for
+# authoritative full-day closures and, in future, other special sessions
+# ============================================================================
+# Phase 1 ships with an EMPTY list on purpose: Nightmark does not fabricate
+# or hardcode a holiday calendar. Any timestamp that falls on a plausible
+# US market holiday but has NO entry here will be classified as an ordinary
+# weekday/weekend/etc per the normal session rules above, UNLESS a caller
+# supplies closure data explicitly (directly, or via this file).
+#
+# Schema: each entry is a small record, not a bare date string, so the
+# schema can grow to cover other special-session types later (e.g. an
+# early-close day) WITHOUT another breaking config/schema change:
+#
+#   - date: "YYYY-MM-DD"
+#     type: full_closure   # the only type Phase 1 actually implements;
+#                          # any other type value is still parsed and
+#                          # stored, but src/calendar.py treats every
+#                          # configured closure entry as UNKNOWN in Phase 1
+#                          # regardless of its type, since modified/partial
+#                          # session handling is not yet implemented.
+#
+# Before this list is used for live or paper trading, it MUST be populated
+# from an authoritative source (e.g. the official NYSE/NASDAQ holiday
+# calendar, cross-checked against Bitget's own stated holiday handling -
+# recall Bitget's support FAQ notes "Weekend access and U.S. market
+# holidays may be limited"). Populating it is a data task, not a code
+# change - src/calendar.py already reads whatever is configured here.
+market_closures: []

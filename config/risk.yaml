@@ -1,0 +1,85 @@
+# Nightmark risk-engine configuration.
+#
+# Every limit here is a policy parameter, not a guess dressed up as one -
+# consistent with the mark_quality.yaml / signal.yaml precedent. Nothing
+# in this file is fabricated market data; these are configured decision
+# thresholds, kept out of src/risk.py so they can be tuned without
+# touching business logic.
+
+# MAX ACTIVE NAMES: maximum number of simultaneously active symbols.
+# Adding to an already-active symbol does not count as opening a new name
+# (see src/risk.py's is_new_name logic) - this limit only blocks opening a
+# position in a symbol that isn't already active.
+max_active_names: 3
+
+# MAX SINGLE-NAME EXPOSURE: maximum fraction of paper NAV any one symbol
+# may carry (existing exposure + proposed increase, absolute notional).
+# Reaching exactly this fraction is allowed; only EXCEEDING it is blocked -
+# this is a sizing constraint (the engine sizes DOWN to fit), not an
+# outright reject, unless available capacity is already zero.
+max_single_name_exposure_pct: 0.25
+
+# MAX GROSS EXPOSURE: maximum fraction of paper NAV across all positions
+# combined (absolute notional, not netted long vs short). Same
+# inclusive-at-the-limit / sizing-not-rejecting behavior as above.
+max_gross_exposure_pct: 1.00
+
+# AVERAGING-DOWN LIMIT: maximum number of explicit averaging-down actions
+# permitted for a single position. Tracked explicitly in
+# PositionState.averaging_down_count by the caller's portfolio state -
+# never inferred from PnL. Reaching this count blocks the NEXT
+# averaging-down request (i.e. count >= max blocks, so with the default of
+# 1, a second averaging-down action is rejected).
+max_averaging_down_count: 1
+
+# COST MODEL (see src/risk.py's _compute_cost_bps for the exact formula).
+# All figures are PER SIDE; the engine doubles them for a round-trip
+# (enter + exit) estimate, since expected edge is also a round-trip
+# quantity (e.g. a basis dislocation reverting to zero).
+#
+#   per_side_cost_bps = fee_bps_per_side
+#                      + (observation_spread_bps / 2)      <- NOT a constant;
+#                                                              taken from the
+#                                                              real injected
+#                                                              spread, never
+#                                                              a mid-price
+#                                                              assumption
+#                      + additional_slippage_bps_per_side
+#                      + weekend_additional_slippage_bps_per_side (WEEKEND only)
+#   total_cost_bps = 2 * per_side_cost_bps
+cost:
+  # Conservative starting fee assumption, per the Nightmark spec. Can be
+  # configured as low as ~1 bps per side for sensitivity/what-if analysis
+  # without any code change.
+  fee_bps_per_side: 5.0
+
+  # Generic additional slippage buffer beyond half-spread, applied on
+  # every session (not just weekend).
+  additional_slippage_bps_per_side: 2.0
+
+  # EXTRA slippage applied only during the Bitget WEEKEND session, to
+  # reflect weekend execution friction (thinner books, wider effective
+  # slippage) beyond the ordinary additional_slippage_bps_per_side above.
+  # Per the Nightmark spec's 2-5 bps guidance; 3.0 is the starting default.
+  weekend_additional_slippage_bps_per_side: 3.0
+
+flatten:
+  # Flatten-before-cash-open buffer. Per the Nightmark spec's 30-90 minute
+  # guidance; 60 is the starting default. A new/increasing OPEN_OR_INCREASE
+  # trade is blocked when time-to-cash-open <= this buffer (inclusive -
+  # exactly at the boundary counts as "inside" the flatten window).
+  buffer_minutes: 60.0
+
+  # Explicit, OFF-by-default opt-in: if true, a FOLLOW signal (only
+  # FOLLOW, never FADE) is exempted from the flatten-window block. This
+  # exception is NEVER silently assumed - it must be turned on here
+  # deliberately, with the reasoning documented by whoever enables it.
+  follow_exception_during_flatten: false
+
+sizing:
+  # Extra derate applied on top of the raw single-name/gross capacity
+  # minimum described in the module docstring's sizing formula.
+  # 1.0 = use the full computed capacity, no extra derate. Set below 1.0
+  # to size more conservatively than the hard limits require (e.g. 0.5 to
+  # never use more than half of available headroom).
+  max_notional_scaling_factor: 1.0

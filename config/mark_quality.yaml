@@ -1,0 +1,82 @@
+# Nightmark mark-quality configuration.
+#
+# Every threshold here is a deliberate choice, not a guess dressed up as
+# one - see the field-by-field notes below. Mark quality is designed to
+# FAIL CLOSED: any symbol/session combination this file does not cover
+# falls back to a conservative default or an explicit rejection, never a
+# silent pass.
+#
+# No corporate-action or halt data is fabricated - `corporate_action_windows`
+# ships empty and must be populated from an authoritative Bitget/exchange
+# source before live or paper trading, exactly like config/sessions.yaml's
+# market_closures.
+
+spread:
+  # Default percentile used to derive a spread ceiling from historical
+  # same-ticker/same-session spread_bps observations, when enough history
+  # exists (see min_history_for_percentile).
+  percentile: 0.90
+
+  # Minimum number of historical spread_bps observations required before
+  # the percentile-based threshold is trusted. Below this, mark quality
+  # falls back to the static fallback_max_spread_bps ceiling below - it
+  # does NOT relax the check just because history is thin.
+  min_history_for_percentile: 20
+
+  # Static ceiling (basis points) used whenever there isn't enough
+  # same-ticker/same-session history to compute a reliable percentile.
+  # Deliberately conservative rather than permissive, since Phase 2B has
+  # no live data to calibrate this against yet. NEEDS APPROVAL / review
+  # once real Bitget rToken spread data is available.
+  fallback_max_spread_bps: 150.0
+
+  # Optional per-symbol overrides of the fallback ceiling above. Empty by
+  # default - no symbol-specific spread behavior has been observed or
+  # fabricated.
+  fallback_max_spread_bps_by_symbol: {}
+
+depth:
+  # Minimum available_depth (see src/normalize.py's available_depth =
+  # min(bid_size, ask_size)) required to consider a quote tradeable.
+  # `null` here means "no default" - an unconfigured symbol FAILS CLOSED
+  # (rejected) rather than silently passing with no minimum enforced.
+  default_min_depth: null
+
+  # Per-symbol minimum depth overrides. Empty by default - no real Bitget
+  # rToken liquidity data has been observed or fabricated for Phase 2B.
+  # Before live/paper trading, this (or default_min_depth) must be
+  # populated from an authoritative source per symbol.
+  min_depth_by_symbol: {}
+
+staleness:
+  # How old the selected reference price is allowed to be, per session,
+  # before it's considered stale. Only OVERNIGHT and WEEKEND are listed
+  # because RTH/POST/HALT/UNKNOWN are already rejected outright by the
+  # session-validity gate regardless of reference freshness.
+  max_age_hours_by_session:
+    OVERNIGHT: 6
+    WEEKEND: 48
+
+  # Bitget-specific weekend behavior: beyond this many hours since the
+  # last official US cash print, a WEEKEND observation is rejected as
+  # stale UNLESS the caller explicitly supplies a corroborating 24/7
+  # witness-market move (has_corroborating_witness_move=True at call
+  # time). Mark quality does not compute or infer that corroboration
+  # itself - it is intentionally an injected input, since deciding
+  # whether a witness-market move corroborates a price relationship is
+  # signal-layer logic, which Phase 2B does not implement.
+  weekend_corroboration_required_beyond_hours: 48
+
+# Configured corporate-action / halt protection windows. Each entry is an
+# explicit [start, end) window in ISO 8601 (any tz-aware format) for one
+# symbol. Empty by default - Nightmark does not fabricate corporate-action
+# data. Before live/paper trading, this must be populated from an
+# authoritative source (e.g. Bitget's own corporate-action notices for the
+# underlying equities, or the underlying exchange's own calendar).
+#
+# Schema:
+#   - symbol: "RNVDA"
+#     start: "2026-01-01T00:00:00-05:00"
+#     end: "2026-01-02T00:00:00-05:00"
+#     kind: "earnings"   # free-text label, recorded but not interpreted
+corporate_action_windows: []
