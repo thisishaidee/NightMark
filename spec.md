@@ -307,6 +307,65 @@ HALT/UNKNOWN specifically, mark-quality, and cost/edge, for both `REDUCE`
 and `FLATTEN`), plus a same-portfolio contrast test proving
 `OPEN_OR_INCREASE` is never exempt under the same conditions.
 
+## Phase 3.5 scope (authorization hardening)
+
+`src/authorize.py` plus fail-closed additions in `src/risk.py`. No
+execution, backtesting, UI, Qwen, or live Bitget trading.
+
+Updated tail of the pipeline:
+
+```
+risk engine (src/risk.py)                                 [Phase 3]
+  + non-finite input rejection                            [Phase 3.5]
+  + timestamp session revalidation on OPEN                [Phase 3.5]
+  + weekend eligibility on WEEKEND OPEN                   [Phase 3.5]
+  |
+  v
+authorize_open_or_increase (src/authorize.py)             [Phase 3.5]
+  sanctioned OPEN authorization; sequences
+  session classification, weekend eligibility, mark
+  quality, evaluate_signal(), evaluate_risk().
+  AuthorizationResult.allowed is the only OPEN
+  authorization boolean. evaluate_risk() ALLOW is a
+  sizing verdict (authorizes_open is always False).
+  |
+  v
+execution / position simulation   <- not implemented
+```
+
+**OPEN vs sizing:** `evaluate_risk()` remains public as the lower-level
+risk/sizing engine and still runs OPEN_OR_INCREASE. It never sets
+`authorizes_open=True`. Callers must not treat `RiskDecision.decision ==
+ALLOW` as permission to send an opening order.
+
+**NAV:** required for OPEN_OR_INCREASE only (missing / non-finite /
+`<= 0` reject). REDUCE/FLATTEN ignore NAV.
+
+**Sibling notionals:** any non-finite or negative position notional
+fail-closes OPEN. REDUCE/FLATTEN validate only the target position.
+
+**Session revalidation (chosen behavior):** reject OPEN_OR_INCREASE if
+`SignalResult.session` disagrees with `SessionCalendar.classify(timestamp)`,
+and use the calendar classification for `is_tradeable()` and weekend
+cost extra. Do not silently rewrite the signal. REDUCE/FLATTEN do not
+revalidate session.
+
+**Weekend eligibility:** WEEKEND OPEN_OR_INCREASE requires
+`SymbolEligibility.is_symbol_configured_eligible(symbol)`. Default
+`config/symbols.yaml` is empty (fail closed). No symbol list is
+fabricated. REDUCE/FLATTEN skip this gate.
+
+**Non-finite inputs:** explicit `math.isfinite` checks on NAV, requested
+notional, spread, expected edge, cost, and position notionals for
+OPEN_OR_INCREASE. Do not rely on Python's `nan` comparison behavior.
+
+Out of scope for Phase 3.5 (deferred, do not silently "fix"):
+- FOLLOW residual vs reference provenance
+- symbol-keyed z-score
+- averaging-down inference
+- holiday calendar population
+- shipped depth-minimum calibration
+
 ## Explicit non-goals for Phase 3
 
 Not implemented, and not to be implemented without a separate approval:

@@ -10,7 +10,8 @@ from zoneinfo import ZoneInfo
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from src.calendar import SessionCalendar, SessionType
+from src.calendar import HaltWindow, SessionCalendar, SessionType
+from src.eligibility import SymbolEligibility, SymbolEligibilityConfig
 from src.signal import Direction, SignalResult, SignalType
 from src.witness import WitnessStatus
 from src.risk import (
@@ -19,7 +20,7 @@ from src.risk import (
     RiskConfig,
     RiskDecisionType,
     TradeAction,
-    evaluate_risk,
+    evaluate_risk as evaluate_risk_raw,
 )
 
 ET = ZoneInfo("America/New_York")
@@ -33,6 +34,14 @@ WEEKEND_TS = et(2026, 9, 19, 13, 0)  # verified Phase 1 WEEKEND timestamp; Monda
 OVERNIGHT_TS = et(2026, 9, 15, 22, 0)  # verified Phase 1 OVERNIGHT timestamp
 RTH_TS = et(2026, 9, 15, 12, 0)
 POST_TS = et(2026, 9, 15, 18, 0)
+# Injected halt (not shipped in config/sessions.yaml). Tuesday 10:05 ET
+# sits inside this window; classify() returns HALT.
+HALT_TS = et(2026, 9, 15, 10, 5)
+HALT_CALENDAR = SessionCalendar(
+    extra_halts=(HaltWindow(start=et(2026, 9, 15, 10, 0), end=et(2026, 9, 15, 10, 15)),)
+)
+# DST spring-forward gap: America/New_York 2026-03-08 02:30 does not exist.
+UNKNOWN_TS = et(2026, 3, 8, 2, 30)
 
 
 def make_signal(
@@ -89,6 +98,22 @@ def portfolio_with(*positions, nav=NAV):
     return PortfolioState(nav=nav, positions=tuple(positions))
 
 
+# Existing Phase 3 tests construct WEEKEND signals without an eligibility
+# config. Phase 3.5 fail-closes weekend OPEN on the shipped empty list, so
+# tests that are not about eligibility inject an explicit allow-list. Tests
+# that need the raw default (empty yaml) call evaluate_risk_raw.
+TEST_WEEKEND_ELIGIBILITY = SymbolEligibility(
+    config=SymbolEligibilityConfig(
+        eligible_symbols=frozenset({"RNVDA", "RTSLA", "A", "B", "C", "D"})
+    )
+)
+
+
+def evaluate_risk(*args, **kwargs):
+    kwargs.setdefault("eligibility", TEST_WEEKEND_ELIGIBILITY)
+    return evaluate_risk_raw(*args, **kwargs)
+
+
 class TestSignalGate(unittest.TestCase):
     def test_valid_fade_can_pass(self):
         sig = make_signal(signal=SignalType.FADE, basis_bps=100.0)
@@ -97,6 +122,7 @@ class TestSignalGate(unittest.TestCase):
             portfolio=empty_portfolio(), config=base_config(), calendar=CALENDAR, spread_bps=5.0,
         )
         self.assertEqual(r.decision, RiskDecisionType.ALLOW)
+        self.assertFalse(r.authorizes_open)
 
     def test_valid_follow_can_pass(self):
         sig = make_signal(signal=SignalType.FOLLOW, direction=Direction.LONG, basis_bps=10.0, residual_bps=100.0)
@@ -154,20 +180,25 @@ class TestSessionGate(unittest.TestCase):
         self.assertEqual(r.decision, RiskDecisionType.REJECT)
 
     def test_halt_rejects(self):
-        sig = make_signal(session=SessionType.HALT)
+        sig = make_signal(timestamp=HALT_TS, session=SessionType.HALT, basis_bps=500.0)
         r = evaluate_risk(
             sig, action=TradeAction.OPEN_OR_INCREASE, requested_notional=1000.0,
-            portfolio=empty_portfolio(), config=base_config(), calendar=CALENDAR, spread_bps=5.0,
+            portfolio=empty_portfolio(), config=base_config(), calendar=HALT_CALENDAR, spread_bps=5.0,
         )
         self.assertEqual(r.decision, RiskDecisionType.REJECT)
+        self.assertTrue(any("session_not_tradeable:HALT" in x for x in r.reasons), r.reasons)
+        self.assertFalse(any("session_timestamp_mismatch" in x for x in r.reasons), r.reasons)
+        self.assertFalse(r.authorizes_open)
 
     def test_unknown_rejects(self):
-        sig = make_signal(session=SessionType.UNKNOWN)
+        sig = make_signal(timestamp=UNKNOWN_TS, session=SessionType.UNKNOWN, basis_bps=500.0)
         r = evaluate_risk(
             sig, action=TradeAction.OPEN_OR_INCREASE, requested_notional=1000.0,
             portfolio=empty_portfolio(), config=base_config(), calendar=CALENDAR, spread_bps=5.0,
         )
         self.assertEqual(r.decision, RiskDecisionType.REJECT)
+        self.assertTrue(any("session_not_tradeable:UNKNOWN" in x for x in r.reasons), r.reasons)
+        self.assertFalse(any("session_timestamp_mismatch" in x for x in r.reasons), r.reasons)
 
     def test_overnight_can_pass(self):
         sig = make_signal(timestamp=OVERNIGHT_TS, session=SessionType.OVERNIGHT, basis_bps=100.0)
@@ -458,12 +489,16 @@ class TestApprovedGateBypassDecision(unittest.TestCase):
 
     def test_reduce_bypasses_session_gate_halt(self):
         existing = PositionState(symbol="RNVDA", direction=Direction.LONG, notional=1_000.0)
-        sig = make_signal(session=SessionType.HALT, direction=Direction.LONG, basis_bps=-100.0)
+        sig = make_signal(
+            timestamp=HALT_TS, session=SessionType.HALT, direction=Direction.LONG, basis_bps=-100.0,
+        )
         r = evaluate_risk(
             sig, action=TradeAction.REDUCE, requested_notional=500.0,
-            portfolio=portfolio_with(existing), config=base_config(), calendar=CALENDAR,
+            portfolio=portfolio_with(existing), config=base_config(), calendar=HALT_CALENDAR,
         )
         self.assertEqual(r.decision, RiskDecisionType.REDUCE)
+        self.assertFalse(any("session_not_tradeable" in x for x in r.reasons), r.reasons)
+        self.assertFalse(any("session_timestamp_mismatch" in x for x in r.reasons), r.reasons)
 
     def test_flatten_bypasses_session_gate_rth(self):
         existing = PositionState(symbol="RNVDA", direction=Direction.LONG, notional=1_000.0)
@@ -476,21 +511,28 @@ class TestApprovedGateBypassDecision(unittest.TestCase):
 
     def test_flatten_bypasses_session_gate_halt(self):
         existing = PositionState(symbol="RNVDA", direction=Direction.LONG, notional=1_000.0)
-        sig = make_signal(session=SessionType.HALT, direction=Direction.LONG, basis_bps=-100.0)
+        sig = make_signal(
+            timestamp=HALT_TS, session=SessionType.HALT, direction=Direction.LONG, basis_bps=-100.0,
+        )
         r = evaluate_risk(
             sig, action=TradeAction.FLATTEN, requested_notional=1_000.0,
-            portfolio=portfolio_with(existing), config=base_config(), calendar=CALENDAR,
+            portfolio=portfolio_with(existing), config=base_config(), calendar=HALT_CALENDAR,
         )
         self.assertEqual(r.decision, RiskDecisionType.FLATTEN)
+        self.assertFalse(any("session_not_tradeable" in x for x in r.reasons), r.reasons)
 
     def test_flatten_bypasses_session_gate_unknown(self):
         existing = PositionState(symbol="RNVDA", direction=Direction.LONG, notional=1_000.0)
-        sig = make_signal(session=SessionType.UNKNOWN, direction=Direction.LONG, basis_bps=-100.0)
+        sig = make_signal(
+            timestamp=UNKNOWN_TS, session=SessionType.UNKNOWN, direction=Direction.LONG, basis_bps=-100.0,
+        )
         r = evaluate_risk(
             sig, action=TradeAction.FLATTEN, requested_notional=1_000.0,
             portfolio=portfolio_with(existing), config=base_config(), calendar=CALENDAR,
         )
         self.assertEqual(r.decision, RiskDecisionType.FLATTEN)
+        self.assertFalse(any("session_not_tradeable" in x for x in r.reasons), r.reasons)
+        self.assertFalse(any("session_timestamp_mismatch" in x for x in r.reasons), r.reasons)
 
     # --- mark-quality gate bypass --------------------------------------------
 
@@ -545,17 +587,18 @@ class TestApprovedGateBypassDecision(unittest.TestCase):
         # DIFFERENT, not-yet-active symbol, so opposite-position lock does
         # not confound the result) is still blocked by all four gates.
         sig = make_signal(
-            symbol="RTSLA", session=SessionType.HALT, signal=SignalType.FLAT,
+            symbol="RTSLA", timestamp=HALT_TS, session=SessionType.HALT, signal=SignalType.FLAT,
             direction=Direction.NONE, basis_bps=None, mark_quality_passed=False,
             mark_quality_reasons=("depth_unavailable",),
         )
         r = evaluate_risk(
             sig, action=TradeAction.OPEN_OR_INCREASE, requested_notional=1_000.0,
-            portfolio=empty_portfolio(), config=base_config(), calendar=CALENDAR, spread_bps=None,
+            portfolio=empty_portfolio(), config=base_config(), calendar=HALT_CALENDAR, spread_bps=None,
         )
         self.assertEqual(r.decision, RiskDecisionType.REJECT)
         self.assertIn("signal_flat_rejected", r.reasons)
-        self.assertTrue(any("session_not_tradeable" in x for x in r.reasons))
+        self.assertTrue(any("session_not_tradeable:HALT" in x for x in r.reasons), r.reasons)
+        self.assertFalse(any("session_timestamp_mismatch" in x for x in r.reasons), r.reasons)
         self.assertIn("mark_quality_failed", r.reasons)
 
 
@@ -926,5 +969,513 @@ class TestMultipleSimultaneousFailures(unittest.TestCase):
         self.assertGreaterEqual(len(r.reasons), 4)
 
 
+class TestNonFiniteInputs(unittest.TestCase):
+    def test_nan_nav_rejects_open(self):
+        sig = make_signal(basis_bps=500.0)
+        r = evaluate_risk(
+            sig, action=TradeAction.OPEN_OR_INCREASE, requested_notional=1_000.0,
+            portfolio=empty_portfolio(nav=float("nan")), config=base_config(),
+            calendar=CALENDAR, spread_bps=10.0,
+        )
+        self.assertEqual(r.decision, RiskDecisionType.REJECT)
+        self.assertIn("non_finite_nav", r.reasons)
+
+    def test_pos_inf_nav_rejects_open(self):
+        sig = make_signal(basis_bps=500.0)
+        r = evaluate_risk(
+            sig, action=TradeAction.OPEN_OR_INCREASE, requested_notional=1_000.0,
+            portfolio=empty_portfolio(nav=float("inf")), config=base_config(),
+            calendar=CALENDAR, spread_bps=10.0,
+        )
+        self.assertEqual(r.decision, RiskDecisionType.REJECT)
+        self.assertIn("non_finite_nav", r.reasons)
+
+    def test_neg_inf_nav_rejects_open(self):
+        sig = make_signal(basis_bps=500.0)
+        r = evaluate_risk(
+            sig, action=TradeAction.OPEN_OR_INCREASE, requested_notional=1_000.0,
+            portfolio=empty_portfolio(nav=float("-inf")), config=base_config(),
+            calendar=CALENDAR, spread_bps=10.0,
+        )
+        self.assertEqual(r.decision, RiskDecisionType.REJECT)
+        self.assertIn("non_finite_nav", r.reasons)
+
+    def test_nan_requested_notional_rejects_open(self):
+        sig = make_signal(basis_bps=500.0)
+        r = evaluate_risk(
+            sig, action=TradeAction.OPEN_OR_INCREASE, requested_notional=float("nan"),
+            portfolio=empty_portfolio(), config=base_config(), calendar=CALENDAR, spread_bps=10.0,
+        )
+        self.assertEqual(r.decision, RiskDecisionType.REJECT)
+        self.assertIn("non_finite_requested_notional", r.reasons)
+        self.assertEqual(r.approved_notional, 0.0)
+
+    def test_inf_requested_notional_rejects_open(self):
+        sig = make_signal(basis_bps=500.0)
+        r = evaluate_risk(
+            sig, action=TradeAction.OPEN_OR_INCREASE, requested_notional=float("inf"),
+            portfolio=empty_portfolio(), config=base_config(), calendar=CALENDAR, spread_bps=10.0,
+        )
+        self.assertEqual(r.decision, RiskDecisionType.REJECT)
+        self.assertIn("non_finite_requested_notional", r.reasons)
+
+    def test_nan_spread_rejects_open(self):
+        sig = make_signal(basis_bps=500.0)
+        r = evaluate_risk(
+            sig, action=TradeAction.OPEN_OR_INCREASE, requested_notional=1_000.0,
+            portfolio=empty_portfolio(), config=base_config(), calendar=CALENDAR,
+            spread_bps=float("nan"),
+        )
+        self.assertEqual(r.decision, RiskDecisionType.REJECT)
+        self.assertIn("non_finite_spread", r.reasons)
+
+    def test_inf_spread_rejects_open(self):
+        sig = make_signal(basis_bps=500.0)
+        r = evaluate_risk(
+            sig, action=TradeAction.OPEN_OR_INCREASE, requested_notional=1_000.0,
+            portfolio=empty_portfolio(), config=base_config(), calendar=CALENDAR,
+            spread_bps=float("inf"),
+        )
+        self.assertEqual(r.decision, RiskDecisionType.REJECT)
+        self.assertIn("non_finite_spread", r.reasons)
+
+    def test_negative_spread_rejects_open(self):
+        sig = make_signal(basis_bps=500.0)
+        r = evaluate_risk(
+            sig, action=TradeAction.OPEN_OR_INCREASE, requested_notional=1_000.0,
+            portfolio=empty_portfolio(), config=base_config(), calendar=CALENDAR,
+            spread_bps=-1.0,
+        )
+        self.assertEqual(r.decision, RiskDecisionType.REJECT)
+        self.assertIn("invalid_spread", r.reasons)
+
+    def test_nan_basis_edge_rejects_open(self):
+        sig = make_signal(basis_bps=float("nan"))
+        r = evaluate_risk(
+            sig, action=TradeAction.OPEN_OR_INCREASE, requested_notional=1_000.0,
+            portfolio=empty_portfolio(), config=base_config(), calendar=CALENDAR, spread_bps=10.0,
+        )
+        self.assertEqual(r.decision, RiskDecisionType.REJECT)
+        self.assertIn("non_finite_expected_edge", r.reasons)
+
+    def test_inf_residual_edge_rejects_follow_open(self):
+        sig = make_signal(
+            signal=SignalType.FOLLOW, direction=Direction.LONG,
+            basis_bps=10.0, residual_bps=float("inf"),
+        )
+        r = evaluate_risk(
+            sig, action=TradeAction.OPEN_OR_INCREASE, requested_notional=1_000.0,
+            portfolio=empty_portfolio(), config=base_config(), calendar=CALENDAR, spread_bps=10.0,
+        )
+        self.assertEqual(r.decision, RiskDecisionType.REJECT)
+        self.assertIn("non_finite_expected_edge", r.reasons)
+
+    def test_nan_existing_position_notional_rejects_open(self):
+        existing = PositionState(symbol="RNVDA", direction=Direction.SHORT, notional=float("nan"))
+        sig = make_signal(basis_bps=500.0)
+        r = evaluate_risk(
+            sig, action=TradeAction.OPEN_OR_INCREASE, requested_notional=1_000.0,
+            portfolio=portfolio_with(existing), config=base_config(), calendar=CALENDAR, spread_bps=10.0,
+        )
+        self.assertEqual(r.decision, RiskDecisionType.REJECT)
+        self.assertIn("non_finite_position_notional", r.reasons)
+
+    def test_negative_existing_notional_rejects_open(self):
+        existing = PositionState(symbol="RNVDA", direction=Direction.SHORT, notional=-5_000.0)
+        sig = make_signal(basis_bps=500.0)
+        r = evaluate_risk(
+            sig, action=TradeAction.OPEN_OR_INCREASE, requested_notional=1_000.0,
+            portfolio=portfolio_with(existing), config=base_config(), calendar=CALENDAR, spread_bps=10.0,
+        )
+        self.assertEqual(r.decision, RiskDecisionType.REJECT)
+        self.assertIn("non_finite_position_notional", r.reasons)
+
+    def test_nan_notional_rejects_reduce(self):
+        existing = PositionState(symbol="RNVDA", direction=Direction.LONG, notional=5_000.0)
+        sig = make_signal(direction=Direction.LONG, basis_bps=-100.0)
+        r = evaluate_risk(
+            sig, action=TradeAction.REDUCE, requested_notional=float("nan"),
+            portfolio=portfolio_with(existing), config=base_config(), calendar=CALENDAR,
+        )
+        self.assertEqual(r.decision, RiskDecisionType.REJECT)
+        self.assertIn("non_finite_requested_notional", r.reasons)
+
+
+class TestSessionRevalidation(unittest.TestCase):
+    def test_claimed_overnight_during_rth_cannot_open(self):
+        sig = make_signal(
+            timestamp=RTH_TS, session=SessionType.OVERNIGHT, basis_bps=500.0,
+        )
+        r = evaluate_risk(
+            sig, action=TradeAction.OPEN_OR_INCREASE, requested_notional=1_000.0,
+            portfolio=empty_portfolio(), config=base_config(), calendar=CALENDAR, spread_bps=10.0,
+        )
+        self.assertEqual(r.decision, RiskDecisionType.REJECT)
+        self.assertTrue(any("session_timestamp_mismatch" in x for x in r.reasons))
+        self.assertTrue(any("session_not_tradeable:RTH" in x for x in r.reasons))
+        self.assertEqual(r.approved_notional, 0.0)
+
+    def test_claimed_weekend_during_rth_cannot_open(self):
+        sig = make_signal(timestamp=RTH_TS, session=SessionType.WEEKEND, basis_bps=500.0)
+        r = evaluate_risk(
+            sig, action=TradeAction.OPEN_OR_INCREASE, requested_notional=1_000.0,
+            portfolio=empty_portfolio(), config=base_config(), calendar=CALENDAR, spread_bps=10.0,
+        )
+        self.assertEqual(r.decision, RiskDecisionType.REJECT)
+        self.assertTrue(any("session_timestamp_mismatch" in x for x in r.reasons))
+
+    def test_matching_overnight_timestamp_can_open(self):
+        sig = make_signal(
+            timestamp=OVERNIGHT_TS, session=SessionType.OVERNIGHT, basis_bps=500.0,
+        )
+        r = evaluate_risk(
+            sig, action=TradeAction.OPEN_OR_INCREASE, requested_notional=1_000.0,
+            portfolio=empty_portfolio(), config=base_config(), calendar=CALENDAR, spread_bps=10.0,
+        )
+        self.assertEqual(r.decision, RiskDecisionType.ALLOW)
+        self.assertFalse(any("session_timestamp_mismatch" in x for x in r.reasons))
+
+    def test_matching_weekend_timestamp_can_open_when_eligible(self):
+        sig = make_signal(timestamp=WEEKEND_TS, session=SessionType.WEEKEND, basis_bps=500.0)
+        r = evaluate_risk(
+            sig, action=TradeAction.OPEN_OR_INCREASE, requested_notional=1_000.0,
+            portfolio=empty_portfolio(), config=base_config(), calendar=CALENDAR, spread_bps=10.0,
+        )
+        self.assertEqual(r.decision, RiskDecisionType.ALLOW)
+
+    def test_post_boundary_mismatch_uses_calendar_class(self):
+        # 16:00 Tuesday is POST; claiming OVERNIGHT must not open.
+        sig = make_signal(timestamp=POST_TS, session=SessionType.OVERNIGHT, basis_bps=500.0)
+        r = evaluate_risk(
+            sig, action=TradeAction.OPEN_OR_INCREASE, requested_notional=1_000.0,
+            portfolio=empty_portfolio(), config=base_config(), calendar=CALENDAR, spread_bps=10.0,
+        )
+        self.assertEqual(r.decision, RiskDecisionType.REJECT)
+        self.assertTrue(any("session_not_tradeable:POST" in x for x in r.reasons))
+
+    def test_reduce_still_allowed_when_session_mismatches(self):
+        existing = PositionState(symbol="RNVDA", direction=Direction.LONG, notional=1_000.0)
+        sig = make_signal(
+            timestamp=RTH_TS, session=SessionType.OVERNIGHT, direction=Direction.LONG, basis_bps=-100.0,
+        )
+        r = evaluate_risk(
+            sig, action=TradeAction.REDUCE, requested_notional=500.0,
+            portfolio=portfolio_with(existing), config=base_config(), calendar=CALENDAR,
+        )
+        self.assertEqual(r.decision, RiskDecisionType.REDUCE)
+        self.assertFalse(any("session_timestamp_mismatch" in x for x in r.reasons))
+
+    def test_flatten_still_allowed_during_actual_rth(self):
+        existing = PositionState(symbol="RNVDA", direction=Direction.LONG, notional=1_000.0)
+        sig = make_signal(
+            timestamp=RTH_TS, session=SessionType.RTH, direction=Direction.LONG, basis_bps=-100.0,
+        )
+        r = evaluate_risk(
+            sig, action=TradeAction.FLATTEN, requested_notional=1_000.0,
+            portfolio=portfolio_with(existing), config=base_config(), calendar=CALENDAR,
+        )
+        self.assertEqual(r.decision, RiskDecisionType.FLATTEN)
+
+    def test_none_direction_on_fade_cannot_open(self):
+        sig = make_signal(direction=Direction.NONE, basis_bps=500.0)
+        r = evaluate_risk(
+            sig, action=TradeAction.OPEN_OR_INCREASE, requested_notional=1_000.0,
+            portfolio=empty_portfolio(), config=base_config(), calendar=CALENDAR, spread_bps=10.0,
+        )
+        self.assertEqual(r.decision, RiskDecisionType.REJECT)
+        self.assertIn("invalid_signal_direction_for_open", r.reasons)
+
+
+class TestWeekendEligibilityGate(unittest.TestCase):
+    def test_eligible_symbol_can_open_on_weekend(self):
+        elig = SymbolEligibility(config=SymbolEligibilityConfig(eligible_symbols=frozenset({"RNVDA"})))
+        sig = make_signal(symbol="RNVDA", basis_bps=500.0)
+        r = evaluate_risk_raw(
+            sig, action=TradeAction.OPEN_OR_INCREASE, requested_notional=1_000.0,
+            portfolio=empty_portfolio(), config=base_config(), calendar=CALENDAR, spread_bps=10.0,
+            eligibility=elig,
+        )
+        self.assertEqual(r.decision, RiskDecisionType.ALLOW)
+        self.assertNotIn("weekend_symbol_not_eligible", r.reasons)
+
+    def test_unlisted_symbol_cannot_open_on_weekend(self):
+        elig = SymbolEligibility(config=SymbolEligibilityConfig(eligible_symbols=frozenset({"RNVDA"})))
+        sig = make_signal(symbol="RNOTLISTED", basis_bps=500.0)
+        r = evaluate_risk_raw(
+            sig, action=TradeAction.OPEN_OR_INCREASE, requested_notional=1_000.0,
+            portfolio=empty_portfolio(), config=base_config(), calendar=CALENDAR, spread_bps=10.0,
+            eligibility=elig,
+        )
+        self.assertEqual(r.decision, RiskDecisionType.REJECT)
+        self.assertIn("weekend_symbol_not_eligible", r.reasons)
+
+    def test_empty_eligibility_config_fails_closed_on_weekend(self):
+        empty = SymbolEligibility(config=SymbolEligibilityConfig())
+        sig = make_signal(symbol="RNVDA", basis_bps=500.0)
+        r = evaluate_risk_raw(
+            sig, action=TradeAction.OPEN_OR_INCREASE, requested_notional=1_000.0,
+            portfolio=empty_portfolio(), config=base_config(), calendar=CALENDAR, spread_bps=10.0,
+            eligibility=empty,
+        )
+        self.assertEqual(r.decision, RiskDecisionType.REJECT)
+        self.assertIn("weekend_symbol_not_eligible", r.reasons)
+
+    def test_omitted_eligibility_uses_shipped_empty_list(self):
+        sig = make_signal(symbol="RNVDA", basis_bps=500.0)
+        r = evaluate_risk_raw(
+            sig, action=TradeAction.OPEN_OR_INCREASE, requested_notional=1_000.0,
+            portfolio=empty_portfolio(), config=base_config(), calendar=CALENDAR, spread_bps=10.0,
+        )
+        self.assertEqual(r.decision, RiskDecisionType.REJECT)
+        self.assertIn("weekend_symbol_not_eligible", r.reasons)
+
+    def test_overnight_does_not_require_weekend_eligibility(self):
+        empty = SymbolEligibility(config=SymbolEligibilityConfig())
+        sig = make_signal(
+            timestamp=OVERNIGHT_TS, session=SessionType.OVERNIGHT, basis_bps=500.0,
+        )
+        r = evaluate_risk_raw(
+            sig, action=TradeAction.OPEN_OR_INCREASE, requested_notional=1_000.0,
+            portfolio=empty_portfolio(), config=base_config(), calendar=CALENDAR, spread_bps=10.0,
+            eligibility=empty,
+        )
+        self.assertEqual(r.decision, RiskDecisionType.ALLOW)
+        self.assertNotIn("weekend_symbol_not_eligible", r.reasons)
+
+    def test_reduce_unlisted_weekend_symbol_still_allowed(self):
+        empty = SymbolEligibility(config=SymbolEligibilityConfig())
+        existing = PositionState(symbol="RNOTLISTED", direction=Direction.LONG, notional=2_000.0)
+        sig = make_signal(symbol="RNOTLISTED", direction=Direction.LONG, basis_bps=-100.0)
+        r = evaluate_risk_raw(
+            sig, action=TradeAction.REDUCE, requested_notional=500.0,
+            portfolio=portfolio_with(existing), config=base_config(), calendar=CALENDAR,
+            eligibility=empty,
+        )
+        self.assertEqual(r.decision, RiskDecisionType.REDUCE)
+        self.assertNotIn("weekend_symbol_not_eligible", r.reasons)
+
+    def test_flatten_unlisted_weekend_symbol_still_allowed(self):
+        empty = SymbolEligibility(config=SymbolEligibilityConfig())
+        existing = PositionState(symbol="RNOTLISTED", direction=Direction.SHORT, notional=2_000.0)
+        sig = make_signal(symbol="RNOTLISTED", direction=Direction.SHORT, basis_bps=100.0)
+        r = evaluate_risk_raw(
+            sig, action=TradeAction.FLATTEN, requested_notional=2_000.0,
+            portfolio=portfolio_with(existing), config=base_config(), calendar=CALENDAR,
+            eligibility=empty,
+        )
+        self.assertEqual(r.decision, RiskDecisionType.FLATTEN)
+        self.assertNotIn("weekend_symbol_not_eligible", r.reasons)
+
+
+class TestAuthorizesOpenBoundary(unittest.TestCase):
+    def test_evaluate_risk_allow_does_not_authorize_open(self):
+        sig = make_signal(timestamp=OVERNIGHT_TS, session=SessionType.OVERNIGHT, basis_bps=500.0)
+        r = evaluate_risk(
+            sig, action=TradeAction.OPEN_OR_INCREASE, requested_notional=1_000.0,
+            portfolio=empty_portfolio(), config=base_config(), calendar=CALENDAR, spread_bps=10.0,
+        )
+        self.assertEqual(r.decision, RiskDecisionType.ALLOW)
+        self.assertFalse(r.authorizes_open)
+        self.assertFalse(r.to_dict()["authorizes_open"])
+
+
+class TestSiblingMalformedNotionals(unittest.TestCase):
+    def test_nan_sibling_does_not_block_reduce_of_clean_target(self):
+        positions = (
+            PositionState(symbol="RNVDA", direction=Direction.LONG, notional=1_000.0),
+            PositionState(symbol="RTSLA", direction=Direction.SHORT, notional=float("nan")),
+        )
+        sig = make_signal(symbol="RNVDA", direction=Direction.LONG, basis_bps=-100.0)
+        r = evaluate_risk(
+            sig, action=TradeAction.REDUCE, requested_notional=500.0,
+            portfolio=portfolio_with(*positions), config=base_config(), calendar=CALENDAR,
+        )
+        self.assertEqual(r.decision, RiskDecisionType.REDUCE)
+        self.assertNotIn("non_finite_position_notional", r.reasons)
+
+    def test_nan_sibling_does_not_block_flatten_of_clean_target(self):
+        positions = (
+            PositionState(symbol="RNVDA", direction=Direction.LONG, notional=1_000.0),
+            PositionState(symbol="RTSLA", direction=Direction.SHORT, notional=float("nan")),
+        )
+        sig = make_signal(symbol="RNVDA", direction=Direction.LONG, basis_bps=-100.0)
+        r = evaluate_risk(
+            sig, action=TradeAction.FLATTEN, requested_notional=1_000.0,
+            portfolio=portfolio_with(*positions), config=base_config(), calendar=CALENDAR,
+        )
+        self.assertEqual(r.decision, RiskDecisionType.FLATTEN)
+        self.assertNotIn("non_finite_position_notional", r.reasons)
+
+    def test_nan_sibling_still_blocks_open(self):
+        positions = (
+            PositionState(symbol="RNVDA", direction=Direction.LONG, notional=1_000.0),
+            PositionState(symbol="RTSLA", direction=Direction.SHORT, notional=float("nan")),
+        )
+        sig = make_signal(symbol="A", timestamp=OVERNIGHT_TS, session=SessionType.OVERNIGHT, basis_bps=500.0)
+        r = evaluate_risk(
+            sig, action=TradeAction.OPEN_OR_INCREASE, requested_notional=1_000.0,
+            portfolio=portfolio_with(*positions), config=base_config(), calendar=CALENDAR, spread_bps=10.0,
+        )
+        self.assertEqual(r.decision, RiskDecisionType.REJECT)
+        self.assertIn("non_finite_position_notional", r.reasons)
+        self.assertFalse(r.authorizes_open)
+
+    def test_nan_target_still_blocks_its_own_reduce(self):
+        positions = (
+            PositionState(symbol="RNVDA", direction=Direction.LONG, notional=1_000.0),
+            PositionState(symbol="RTSLA", direction=Direction.SHORT, notional=float("nan")),
+        )
+        sig = make_signal(symbol="RTSLA", direction=Direction.SHORT, basis_bps=100.0)
+        r = evaluate_risk(
+            sig, action=TradeAction.REDUCE, requested_notional=500.0,
+            portfolio=portfolio_with(*positions), config=base_config(), calendar=CALENDAR,
+        )
+        self.assertEqual(r.decision, RiskDecisionType.REJECT)
+        self.assertIn("non_finite_position_notional", r.reasons)
+
+    def test_nan_target_still_blocks_its_own_flatten(self):
+        positions = (
+            PositionState(symbol="RNVDA", direction=Direction.LONG, notional=1_000.0),
+            PositionState(symbol="RTSLA", direction=Direction.SHORT, notional=float("nan")),
+        )
+        sig = make_signal(symbol="RTSLA", direction=Direction.SHORT, basis_bps=100.0)
+        r = evaluate_risk(
+            sig, action=TradeAction.FLATTEN, requested_notional=1_000.0,
+            portfolio=portfolio_with(*positions), config=base_config(), calendar=CALENDAR,
+        )
+        self.assertEqual(r.decision, RiskDecisionType.REJECT)
+        self.assertIn("non_finite_position_notional", r.reasons)
+
+    def test_negative_sibling_does_not_block_flatten_of_clean_target(self):
+        positions = (
+            PositionState(symbol="RNVDA", direction=Direction.LONG, notional=1_000.0),
+            PositionState(symbol="RTSLA", direction=Direction.SHORT, notional=-5_000.0),
+        )
+        sig = make_signal(symbol="RNVDA", direction=Direction.LONG, basis_bps=-100.0)
+        r = evaluate_risk(
+            sig, action=TradeAction.FLATTEN, requested_notional=1_000.0,
+            portfolio=portfolio_with(*positions), config=base_config(), calendar=CALENDAR,
+        )
+        self.assertEqual(r.decision, RiskDecisionType.FLATTEN)
+        self.assertNotIn("non_finite_position_notional", r.reasons)
+
+    def test_negative_sibling_still_blocks_open(self):
+        positions = (
+            PositionState(symbol="RNVDA", direction=Direction.LONG, notional=1_000.0),
+            PositionState(symbol="RTSLA", direction=Direction.SHORT, notional=-5_000.0),
+        )
+        sig = make_signal(symbol="A", timestamp=OVERNIGHT_TS, session=SessionType.OVERNIGHT, basis_bps=500.0)
+        r = evaluate_risk(
+            sig, action=TradeAction.OPEN_OR_INCREASE, requested_notional=1_000.0,
+            portfolio=portfolio_with(*positions), config=base_config(), calendar=CALENDAR, spread_bps=10.0,
+        )
+        self.assertEqual(r.decision, RiskDecisionType.REJECT)
+        self.assertIn("non_finite_position_notional", r.reasons)
+
+    def test_negative_target_still_blocks_its_own_reduce(self):
+        positions = (
+            PositionState(symbol="RNVDA", direction=Direction.LONG, notional=1_000.0),
+            PositionState(symbol="RTSLA", direction=Direction.SHORT, notional=-5_000.0),
+        )
+        sig = make_signal(symbol="RTSLA", direction=Direction.SHORT, basis_bps=100.0)
+        r = evaluate_risk(
+            sig, action=TradeAction.REDUCE, requested_notional=500.0,
+            portfolio=portfolio_with(*positions), config=base_config(), calendar=CALENDAR,
+        )
+        self.assertEqual(r.decision, RiskDecisionType.REJECT)
+        self.assertIn("non_finite_position_notional", r.reasons)
+
+
+class TestNavIsOpenOnly(unittest.TestCase):
+    def _valid_long(self):
+        return PositionState(symbol="RNVDA", direction=Direction.LONG, notional=1_000.0)
+
+    def test_none_nav_allows_reduce(self):
+        sig = make_signal(direction=Direction.LONG, basis_bps=-100.0)
+        r = evaluate_risk(
+            sig, action=TradeAction.REDUCE, requested_notional=500.0,
+            portfolio=portfolio_with(self._valid_long(), nav=None), config=base_config(),
+            calendar=CALENDAR,
+        )
+        self.assertEqual(r.decision, RiskDecisionType.REDUCE)
+        self.assertNotIn("missing_or_invalid_nav", r.reasons)
+        self.assertNotIn("non_finite_nav", r.reasons)
+
+    def test_nan_nav_allows_reduce(self):
+        sig = make_signal(direction=Direction.LONG, basis_bps=-100.0)
+        r = evaluate_risk(
+            sig, action=TradeAction.REDUCE, requested_notional=500.0,
+            portfolio=portfolio_with(self._valid_long(), nav=float("nan")), config=base_config(),
+            calendar=CALENDAR,
+        )
+        self.assertEqual(r.decision, RiskDecisionType.REDUCE)
+        self.assertNotIn("non_finite_nav", r.reasons)
+
+    def test_inf_nav_allows_reduce(self):
+        sig = make_signal(direction=Direction.LONG, basis_bps=-100.0)
+        r = evaluate_risk(
+            sig, action=TradeAction.REDUCE, requested_notional=500.0,
+            portfolio=portfolio_with(self._valid_long(), nav=float("inf")), config=base_config(),
+            calendar=CALENDAR,
+        )
+        self.assertEqual(r.decision, RiskDecisionType.REDUCE)
+        self.assertNotIn("non_finite_nav", r.reasons)
+
+    def test_none_nav_allows_flatten(self):
+        sig = make_signal(direction=Direction.LONG, basis_bps=-100.0)
+        r = evaluate_risk(
+            sig, action=TradeAction.FLATTEN, requested_notional=1_000.0,
+            portfolio=portfolio_with(self._valid_long(), nav=None), config=base_config(),
+            calendar=CALENDAR,
+        )
+        self.assertEqual(r.decision, RiskDecisionType.FLATTEN)
+
+    def test_nan_nav_allows_flatten(self):
+        sig = make_signal(direction=Direction.LONG, basis_bps=-100.0)
+        r = evaluate_risk(
+            sig, action=TradeAction.FLATTEN, requested_notional=1_000.0,
+            portfolio=portfolio_with(self._valid_long(), nav=float("nan")), config=base_config(),
+            calendar=CALENDAR,
+        )
+        self.assertEqual(r.decision, RiskDecisionType.FLATTEN)
+
+    def test_inf_nav_allows_flatten(self):
+        sig = make_signal(direction=Direction.LONG, basis_bps=-100.0)
+        r = evaluate_risk(
+            sig, action=TradeAction.FLATTEN, requested_notional=1_000.0,
+            portfolio=portfolio_with(self._valid_long(), nav=float("inf")), config=base_config(),
+            calendar=CALENDAR,
+        )
+        self.assertEqual(r.decision, RiskDecisionType.FLATTEN)
+
+    def test_none_nav_still_rejects_open(self):
+        sig = make_signal(timestamp=OVERNIGHT_TS, session=SessionType.OVERNIGHT, basis_bps=500.0)
+        r = evaluate_risk(
+            sig, action=TradeAction.OPEN_OR_INCREASE, requested_notional=1_000.0,
+            portfolio=empty_portfolio(nav=None), config=base_config(), calendar=CALENDAR, spread_bps=10.0,
+        )
+        self.assertEqual(r.decision, RiskDecisionType.REJECT)
+        self.assertIn("missing_or_invalid_nav", r.reasons)
+
+    def test_nan_nav_still_rejects_open(self):
+        sig = make_signal(timestamp=OVERNIGHT_TS, session=SessionType.OVERNIGHT, basis_bps=500.0)
+        r = evaluate_risk(
+            sig, action=TradeAction.OPEN_OR_INCREASE, requested_notional=1_000.0,
+            portfolio=empty_portfolio(nav=float("nan")), config=base_config(), calendar=CALENDAR, spread_bps=10.0,
+        )
+        self.assertEqual(r.decision, RiskDecisionType.REJECT)
+        self.assertIn("non_finite_nav", r.reasons)
+
+    def test_inf_nav_still_rejects_open(self):
+        sig = make_signal(timestamp=OVERNIGHT_TS, session=SessionType.OVERNIGHT, basis_bps=500.0)
+        r = evaluate_risk(
+            sig, action=TradeAction.OPEN_OR_INCREASE, requested_notional=1_000.0,
+            portfolio=empty_portfolio(nav=float("inf")), config=base_config(), calendar=CALENDAR, spread_bps=10.0,
+        )
+        self.assertEqual(r.decision, RiskDecisionType.REJECT)
+        self.assertIn("non_finite_nav", r.reasons)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+

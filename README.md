@@ -3,14 +3,14 @@
 Session-aware quantitative strategy for Bitget rTokens — Bitget AI Hackathon S2,
 Track: Alpha Factory, Sub-theme: After-Hours Information Pricing.
 
-**Status: Phases 1, 2A, 2B, 2C, and 3 implemented.** Session calendar,
+**Status: Phases 1, 2A, 2B, 2C, 3, and 3.5 implemented.** Session calendar,
 weekend eligibility, the market-observation data contract/basis/z-score,
 the mark-quality gate, the deterministic FADE/FOLLOW/FLAT signal engine,
-and the risk engine (position sizing + trade authorization) all exist and
-are tested. No Qwen integration, execution, backtesting, or UI exist yet.
-See `spec.md` for the governing architecture and rules, and each phase's
-report for what was built, what's ambiguous, and what needs approval
-before the next phase.
+the risk engine (position sizing + trade authorization), and the Phase 3.5
+authorization façade (non-finite rejection, session revalidation, weekend
+eligibility on OPEN, single legal path for OPEN_OR_INCREASE) all exist
+and are tested. No Qwen integration, execution, backtesting, or UI exist
+yet. See `spec.md` for the governing architecture and rules.
 
 ## Core thesis
 
@@ -49,7 +49,8 @@ nightmark/
 │   ├── mark_quality.py  # fail-closed mark-quality gate (6 checks)                 [Phase 2B]
 │   ├── witness.py       # 24/7 witness-market classification (injected data only)  [Phase 2C]
 │   ├── signal.py        # deterministic FADE/FOLLOW/FLAT signal engine             [Phase 2C]
-│   └── risk.py          # position sizing + trade authorization, fail-closed       [Phase 3]
+│   ├── risk.py          # position sizing + trade authorization, fail-closed       [Phase 3]
+│   └── authorize.py     # OPEN_OR_INCREASE façade (legal authorization path)      [Phase 3.5]
 ├── tests/              # deterministic unit tests
 ├── notebooks/          # (empty — reserved for later phases)
 ├── playbook/           # (empty — reserved for later phases)
@@ -198,6 +199,44 @@ built on top of it.
   (`ALLOW`/`REDUCE`/`REJECT`/`FLATTEN`) with an approved/max notional —
   execution, PnL tracking, and portfolio-state persistence remain
   unimplemented.
+
+## Phase 3.5 Authorization Hardening
+
+Closes confirmed fail-open paths on `OPEN_OR_INCREASE` before any
+execution/backtest work. `REDUCE`/`FLATTEN` keep the approved Phase 3
+exit bypass (session, mark-quality, signal, cost/edge, and weekend
+eligibility are not applied to exits).
+
+- **Non-finite inputs fail closed.** `evaluate_risk()` rejects NaN,
+  `+inf`, and `-inf` for NAV, requested notional, spread, expected edge,
+  computed cost, and position notionals. Python comparison quirks
+  (`x < nan` is always False) are not relied on. Negative spreads and
+  negative position notionals are also rejected on OPEN.
+- **Session revalidation.** `SignalResult.session` is not the session
+  authority for an open. When a calendar is supplied, `evaluate_risk()`
+  classifies `signal.timestamp` and (1) rejects a mismatch against the
+  claimed session, (2) uses the calendar result for `is_tradeable()` and
+  weekend extra-slippage. A signal that claims OVERNIGHT at an RTH
+  timestamp cannot authorize an opening trade. Missing calendar still
+  fails closed rather than trusting the self-reported session.
+- **Weekend eligibility on OPEN.** A WEEKEND `OPEN_OR_INCREASE` requires
+  the symbol to be in the configured weekend-eligible set
+  (`src.eligibility.SymbolEligibility`). `config/symbols.yaml` still
+  ships empty, so the default is fail-closed. OVERNIGHT opens do not use
+  this list. No Bitget symbol list is fabricated here.
+- **Sanctioned OPEN path vs sizing engine.** `evaluate_risk()` is the
+  public lower-level sizing/limit primitive and still evaluates
+  `OPEN_OR_INCREASE` (so tests can inspect capacity). `ALLOW` from
+  `evaluate_risk()` is not permission to open: `RiskDecision.authorizes_open`
+  is always `False`. The only OPEN authorization boolean is
+  `AuthorizationResult.allowed` from `src.authorize.authorize_open_or_increase()`.
+  Direct `evaluate_risk()` remains the REDUCE/FLATTEN path.
+- **NAV is an OPEN gate.** Missing, non-finite, and `<= 0` NAV reject
+  `OPEN_OR_INCREASE`. REDUCE/FLATTEN do not use NAV and must not be
+  blocked by it.
+- **Sibling malformed notionals.** Any non-finite or negative position
+  notional fail-closes OPEN (gross/capacity cannot be trusted). REDUCE/
+  FLATTEN of a clean target are not blocked by an unrelated sibling.
 
 ## Running the tests
 
